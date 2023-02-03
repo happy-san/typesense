@@ -1452,11 +1452,9 @@ Option<nlohmann::json> Collection::search(const std::string & raw_query,
                                                  facet_sample_percent, facet_sample_threshold);
 
     std::unique_ptr<search_args> search_params_guard(search_params);
-
-    index->run_search(search_params);
+    index->run_search(search_params, name);
 
     // for grouping we have to re-aggregate
-
     Topster& topster = *search_params->topster;
     Topster& curated_topster = *search_params->curated_topster;
 
@@ -2416,7 +2414,7 @@ Option<bool> Collection::get_filter_ids(const std::string & filter_query,
 
     uint32_t* filter_ids = nullptr;
     uint32_t filter_ids_len = 0;
-    index->do_filtering_with_lock(filter_ids, filter_ids_len, filter_tree_root);
+    index->do_filtering_with_lock(filter_ids, filter_ids_len, filter_tree_root, name);
     index_ids.emplace_back(filter_ids_len, filter_ids);
 
     delete filter_tree_root;
