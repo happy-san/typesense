@@ -43,6 +43,20 @@ void num_tree_t::range_inclusive_search(int64_t start, int64_t end, uint32_t** i
     *ids = out;
 }
 
+void num_tree_t::approx_range_inclusive_search_count(int64_t start, int64_t end, uint32_t& ids_len) {
+    if (int64map.empty()) {
+        return;
+    }
+
+    auto it_start = int64map.lower_bound(start);  // iter values will be >= start
+
+    while (it_start != int64map.end() && it_start->first <= end) {
+        uint32_t val_ids = ids_t::num_ids(it_start->second);
+        ids_len += val_ids;
+        it_start++;
+    }
+}
+
 size_t num_tree_t::get(int64_t value, std::vector<uint32_t>& geo_result_ids) {
     const auto& it = int64map.find(value);
     if(it == int64map.end()) {
@@ -129,6 +143,54 @@ void num_tree_t::search(NUM_COMPARATOR comparator, int64_t value, uint32_t** ids
 
         delete [] *ids;
         *ids = out;
+    }
+}
+
+void num_tree_t::approx_search_count(NUM_COMPARATOR comparator, int64_t value, uint32_t& ids_len) {
+    if (int64map.empty()) {
+        return;
+    }
+
+    if (comparator == EQUALS) {
+        const auto& it = int64map.find(value);
+        if (it != int64map.end()) {
+            uint32_t val_ids = ids_t::num_ids(it->second);
+            ids_len += val_ids;
+        }
+    } else if (comparator == GREATER_THAN || comparator == GREATER_THAN_EQUALS) {
+        // iter entries will be >= value, or end() if all entries are before value
+        auto iter_ge_value = int64map.lower_bound(value);
+
+        if (iter_ge_value == int64map.end()) {
+            return;
+        }
+
+        if (comparator == GREATER_THAN && iter_ge_value->first == value) {
+            iter_ge_value++;
+        }
+
+        while (iter_ge_value != int64map.end()) {
+            uint32_t val_ids = ids_t::num_ids(iter_ge_value->second);
+            ids_len += val_ids;
+            iter_ge_value++;
+        }
+    } else if (comparator == LESS_THAN || comparator == LESS_THAN_EQUALS) {
+        // iter entries will be >= value, or end() if all entries are before value
+        auto iter_ge_value = int64map.lower_bound(value);
+
+        auto it = int64map.begin();
+
+        while (it != iter_ge_value) {
+            uint32_t val_ids = ids_t::num_ids(it->second);
+            ids_len += val_ids;
+            it++;
+        }
+
+        // for LESS_THAN_EQUALS, check if last iter entry is equal to value
+        if (it != int64map.end() && comparator == LESS_THAN_EQUALS && it->first == value) {
+            uint32_t val_ids = ids_t::num_ids(it->second);
+            ids_len += val_ids;
+        }
     }
 }
 
