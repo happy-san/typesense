@@ -1608,11 +1608,18 @@ void Index::search_candidates(const uint8_t & field_id, bool field_is_array,
 
 void Index::numeric_not_equals_filter(num_tree_t* const num_tree,
                                       const int64_t value,
-                                      uint32_t*& ids,
-                                      size_t& ids_len) const {
+                                      const uint32_t& context_ids_length,
+                                      const uint32_t* context_ids,
+                                      size_t& ids_len,
+                                      uint32_t*& ids) const {
     uint32_t* to_exclude_ids = nullptr;
     size_t to_exclude_ids_len = 0;
-    num_tree->search(EQUALS, value, &to_exclude_ids, to_exclude_ids_len);
+
+    if (context_ids_length != 0) {
+        num_tree->contains(EQUALS, value, context_ids_length, context_ids, to_exclude_ids_len, to_exclude_ids);
+    } else {
+        num_tree->search(EQUALS, value, &to_exclude_ids, to_exclude_ids_len);
+    }
 
     auto all_ids = seq_ids->uncompress();
     auto all_ids_size = seq_ids->num_ids();
@@ -1627,8 +1634,8 @@ void Index::numeric_not_equals_filter(num_tree_t* const num_tree,
     delete[] to_exclude_ids;
 
     uint32_t* out = nullptr;
-    ids_len = ArrayUtils::or_scalar(ids, ids_len,
-                                    to_include_ids, to_include_ids_len, &out);
+    ids_len = ArrayUtils::or_scalar(ids, ids_len, to_include_ids, to_include_ids_len, &out);
+
     delete[] ids;
     delete[] to_include_ids;
 
@@ -1643,7 +1650,9 @@ bool Index::field_is_indexed(const std::string& field_name) const {
 
 Option<bool> Index::do_filtering(filter_node_t* const root,
                                  filter_result_t& result,
-                                 const std::string& collection_name) const {
+                                 const std::string& collection_name,
+                                 const uint32_t& context_ids_length,
+                                 const uint32_t* context_ids) const {
     // auto begin = std::chrono::high_resolution_clock::now();
     const filter a_filter = root->filter_exp;
 
@@ -1655,13 +1664,46 @@ Option<bool> Index::do_filtering(filter_node_t* const root,
         if (collection == nullptr) {
             return Option<bool>(400, "Referenced collection `" + a_filter.referenced_collection_name + "` not found.");
         }
+
+        filter_result_t reference_filter_result;
         auto reference_filter_op = collection->get_reference_filter_ids(a_filter.field_name,
-                                                                        result,
+                                                                        reference_filter_result,
                                                                         collection_name);
         if (!reference_filter_op.ok()) {
             return reference_filter_op;
         }
 
+        if (context_ids_length != 0) {
+            std::vector<uint32_t> include_indexes;
+            include_indexes.reserve(std::min(context_ids_length, reference_filter_result.count));
+
+            size_t context_index = 0, reference_result_index = 0;
+            while (context_index < context_ids_length && reference_result_index < reference_filter_result.count) {
+                if (context_ids[context_index] == reference_filter_result.docs[reference_result_index]) {
+                    include_indexes.push_back(reference_result_index);
+                    context_index++;
+                    reference_result_index++;
+                } else if (context_ids[context_index] < reference_filter_result.docs[reference_result_index]) {
+                    context_index++;
+                } else {
+                    reference_result_index++;
+                }
+            }
+
+            result.count = include_indexes.size();
+            result.docs = new uint32_t[include_indexes.size()];
+            auto& result_references = result.reference_filter_results[a_filter.referenced_collection_name];
+            result_references = new reference_filter_result_t[include_indexes.size()];
+
+            for (uint32_t i = 0; i < include_indexes.size(); i++) {
+                result.docs[i] = reference_filter_result.docs[include_indexes[i]];
+                result_references[i] = reference_filter_result.reference_filter_results[a_filter.referenced_collection_name][include_indexes[i]];
+            }
+
+            return Option(true);
+        }
+
+        result = reference_filter_result;
         return Option(true);
     }
 
@@ -1674,10 +1716,22 @@ Option<bool> Index::do_filtering(filter_node_t* const root,
 
         std::sort(result_ids.begin(), result_ids.end());
 
-        result.docs = new uint32[result_ids.size()];
-        std::copy(result_ids.begin(), result_ids.end(), result.docs);
-        result.count = result_ids.size();
+        auto result_array = new uint32[result_ids.size()];
+        std::copy(result_ids.begin(), result_ids.end(), result_array);
 
+        if (context_ids_length != 0) {
+            uint32_t* out = nullptr;
+            result.count = ArrayUtils::and_scalar(context_ids, context_ids_length,
+                                                  result_array, result_ids.size(), &out);
+
+            delete[] result_array;
+
+            result.docs = out;
+            return Option(true);
+        }
+
+        result.docs = result_array;
+        result.count = result_ids.size();
         return Option(true);
     }
 
@@ -1699,13 +1753,25 @@ Option<bool> Index::do_filtering(filter_node_t* const root,
 
             if(a_filter.comparators[fi] == RANGE_INCLUSIVE && fi+1 < a_filter.values.size()) {
                 const std::string& next_filter_value = a_filter.values[fi + 1];
-                int64_t range_end_value = (int64_t)std::stol(next_filter_value);
-                num_tree->range_inclusive_search(value, range_end_value, &result_ids, result_ids_len);
+                auto const range_end_value = (int64_t)std::stol(next_filter_value);
+
+                if (context_ids_length != 0) {
+                    num_tree->range_inclusive_contains(value, range_end_value, context_ids_length, context_ids,
+                                                       result_ids_len, result_ids);
+                } else {
+                    num_tree->range_inclusive_search(value, range_end_value, &result_ids, result_ids_len);
+                }
+
                 fi++;
             } else if (a_filter.comparators[fi] == NOT_EQUALS) {
-                numeric_not_equals_filter(num_tree, value, result_ids, result_ids_len);
+                numeric_not_equals_filter(num_tree, value, context_ids_length, context_ids, result_ids_len, result_ids);
             } else {
-                num_tree->search(a_filter.comparators[fi], value, &result_ids, result_ids_len);
+                if (context_ids_length != 0) {
+                    num_tree->contains(a_filter.comparators[fi], value,
+                                       context_ids_length, context_ids, result_ids_len, result_ids);
+                } else {
+                    num_tree->search(a_filter.comparators[fi], value, &result_ids, result_ids_len);
+                }
             }
         }
     } else if (f.is_float()) {
@@ -1719,12 +1785,25 @@ Option<bool> Index::do_filtering(filter_node_t* const root,
             if(a_filter.comparators[fi] == RANGE_INCLUSIVE && fi+1 < a_filter.values.size()) {
                 const std::string& next_filter_value = a_filter.values[fi+1];
                 int64_t range_end_value = float_to_int64_t((float) std::atof(next_filter_value.c_str()));
-                num_tree->range_inclusive_search(float_int64, range_end_value, &result_ids, result_ids_len);
+
+                if (context_ids_length != 0) {
+                    num_tree->range_inclusive_contains(float_int64, range_end_value, context_ids_length, context_ids,
+                                                       result_ids_len, result_ids);
+                } else {
+                    num_tree->range_inclusive_search(float_int64, range_end_value, &result_ids, result_ids_len);
+                }
+
                 fi++;
             } else if (a_filter.comparators[fi] == NOT_EQUALS) {
-                numeric_not_equals_filter(num_tree, value, result_ids, result_ids_len);
+                numeric_not_equals_filter(num_tree, float_int64,
+                                          context_ids_length, context_ids, result_ids_len, result_ids);
             } else {
-                num_tree->search(a_filter.comparators[fi], float_int64, &result_ids, result_ids_len);
+                if (context_ids_length != 0) {
+                    num_tree->contains(a_filter.comparators[fi], float_int64,
+                                       context_ids_length, context_ids, result_ids_len, result_ids);
+                } else {
+                    num_tree->search(a_filter.comparators[fi], float_int64, &result_ids, result_ids_len);
+                }
             }
         }
     } else if (f.is_bool()) {
@@ -1734,9 +1813,15 @@ Option<bool> Index::do_filtering(filter_node_t* const root,
         for (const std::string& filter_value : a_filter.values) {
             int64_t bool_int64 = (filter_value == "1") ? 1 : 0;
             if (a_filter.comparators[value_index] == NOT_EQUALS) {
-                numeric_not_equals_filter(num_tree, bool_int64, result_ids, result_ids_len);
+                numeric_not_equals_filter(num_tree, bool_int64,
+                                          context_ids_length, context_ids, result_ids_len, result_ids);
             } else {
-                num_tree->search(a_filter.comparators[value_index], bool_int64, &result_ids, result_ids_len);
+                if (context_ids_length != 0) {
+                    num_tree->contains(a_filter.comparators[value_index], bool_int64,
+                                       context_ids_length, context_ids, result_ids_len, result_ids);
+                } else {
+                    num_tree->search(a_filter.comparators[value_index], bool_int64, &result_ids, result_ids_len);
+                }
             }
 
             value_index++;
@@ -1810,6 +1895,14 @@ Option<bool> Index::do_filtering(filter_node_t* const root,
 
             // `geo_result_ids` will contain all IDs that are within approximately within query radius
             // we still need to do another round of exact filtering on them
+
+            if (context_ids_length != 0) {
+                uint32_t *out = nullptr;
+                uint32_t count = ArrayUtils::and_scalar(context_ids, context_ids_length,
+                                                        &geo_result_ids[0], geo_result_ids.size(), &out);
+
+                geo_result_ids = std::vector<uint32_t>(out, out + count);
+            }
 
             std::vector<uint32_t> exact_geo_result_ids;
 
@@ -1898,7 +1991,7 @@ Option<bool> Index::do_filtering(filter_node_t* const root,
             if(a_filter.comparators[0] == EQUALS || a_filter.comparators[0] == NOT_EQUALS) {
                 // needs intersection + exact matching (unlike CONTAINS)
                 std::vector<uint32_t> result_id_vec;
-                posting_t::intersect(posting_lists, result_id_vec);
+                posting_t::intersect(posting_lists, result_id_vec, context_ids_length, context_ids);
 
                 if (result_id_vec.empty()) {
                     continue;
@@ -1922,7 +2015,7 @@ Option<bool> Index::do_filtering(filter_node_t* const root,
             } else {
                 // CONTAINS
                 size_t before_size = f_id_buff.size();
-                posting_t::intersect(posting_lists, f_id_buff);
+                posting_t::intersect(posting_lists, f_id_buff, context_ids_length, context_ids);
                 if (f_id_buff.size() == before_size) {
                     continue;
                 }
@@ -1970,6 +2063,17 @@ Option<bool> Index::do_filtering(filter_node_t* const root,
 
         result_ids = to_include_ids;
         result_ids_len = to_include_ids_len;
+
+        if (context_ids_length != 0) {
+            uint32_t *out = nullptr;
+            result.count = ArrayUtils::and_scalar(context_ids, context_ids_length,
+                                                  result_ids, result_ids_len, &out);
+
+            delete[] result_ids;
+
+            result.docs = out;
+            return Option(true);
+        }
     }
 
     result.docs = result_ids;
@@ -2146,19 +2250,23 @@ Option<bool> Index::rearranging_recursive_filter(filter_node_t* const filter_tre
 }
 
 void copy_reference_ids(filter_result_t& from, filter_result_t& to) {
-    if (to.count > 0 && from.reference_filter_result != nullptr && from.reference_filter_result->count > 0) {
-        to.reference_filter_result = new reference_filter_result_t[to.count];
+    if (to.count > 0 && !from.reference_filter_results.empty()) {
+        for (const auto &item: from.reference_filter_results) {
+            auto& from_reference_result = from.reference_filter_results[item.first];
+            auto& to_reference_result = to.reference_filter_results[item.first];
+            to_reference_result = new reference_filter_result_t[to.count];
 
-        size_t to_index = 0, from_index = 0;
-        while (to_index < to.count && from_index < from.count) {
-            if (to.docs[to_index] == from.docs[from_index]) {
-                to.reference_filter_result[to_index] = from.reference_filter_result[from_index];
-                to_index++;
-                from_index++;
-            } else if (to.docs[to_index] < from.docs[from_index]) {
-                to_index++;
-            } else {
-                from_index++;
+            size_t to_index = 0, from_index = 0;
+            while (to_index < to.count && from_index < from.count) {
+                if (to.docs[to_index] == from.docs[from_index]) {
+                    to_reference_result[to_index] = from_reference_result[from_index];
+                    to_index++;
+                    from_index++;
+                } else if (to.docs[to_index] < from.docs[from_index]) {
+                    to_index++;
+                } else {
+                    from_index++;
+                }
             }
         }
     }
@@ -2200,8 +2308,8 @@ Option<bool> Index::recursive_filter(filter_node_t* const root,
         }
 
         result.docs = filtered_results;
-        if (l_result.reference_filter_result != nullptr || r_result.reference_filter_result != nullptr) {
-            copy_reference_ids(l_result.reference_filter_result != nullptr ? l_result : r_result, result);
+        if (!l_result.reference_filter_results.empty() || !r_result.reference_filter_results.empty()) {
+            copy_reference_ids(!l_result.reference_filter_results.empty() ? l_result : r_result, result);
         }
 
         return Option(true);
@@ -2244,7 +2352,8 @@ Option<bool> Index::do_filtering_with_lock(filter_node_t* const filter_tree_root
 
 Option<bool> Index::do_reference_filtering_with_lock(filter_node_t* const filter_tree_root,
                                                      filter_result_t& filter_result,
-                                                     const std::string & reference_helper_field_name) const {
+                                                     const std::string& collection_name,
+                                                     const std::string& reference_helper_field_name) const {
     std::shared_lock lock(mutex);
 
     filter_result_t reference_filter_result;
@@ -2264,15 +2373,17 @@ Option<bool> Index::do_reference_filtering_with_lock(filter_node_t* const filter
 
     filter_result.count = reference_map.size();
     filter_result.docs = new uint32_t[reference_map.size()];
-    filter_result.reference_filter_result = new reference_filter_result_t[reference_map.size()];
+    filter_result.reference_filter_results[collection_name] = new reference_filter_result_t[reference_map.size()];
 
     size_t doc_index = 0;
     for (auto &item: reference_map) {
         filter_result.docs[doc_index] = item.first;
 
-        filter_result.reference_filter_result[doc_index].count = item.second.size();
-        filter_result.reference_filter_result[doc_index].docs = new uint32_t[item.second.size()];
-        std::copy(item.second.begin(), item.second.end(), filter_result.reference_filter_result[doc_index].docs);
+        auto& reference_result = filter_result.reference_filter_results[collection_name][doc_index];
+        reference_result.count = item.second.size();
+        reference_result.docs = new uint32_t[item.second.size()];
+        std::copy(item.second.begin(), item.second.end(), reference_result.docs);
+
         doc_index++;
     }
 

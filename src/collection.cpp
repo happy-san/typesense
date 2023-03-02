@@ -2436,8 +2436,6 @@ Option<bool> Collection::get_filter_ids(const std::string& filter_query, filter_
 }
 
 Option<std::string> Collection::get_reference_field(const std::string & collection_name) const {
-    std::shared_lock lock(mutex);
-
     std::string reference_field_name;
     for (auto const& pair: reference_fields) {
         auto reference_pair = pair.second;
@@ -2458,12 +2456,12 @@ Option<std::string> Collection::get_reference_field(const std::string & collecti
 Option<bool> Collection::get_reference_filter_ids(const std::string & filter_query,
                                                   filter_result_t& filter_result,
                                                   const std::string & collection_name) const {
+    std::shared_lock lock(mutex);
+
     auto reference_field_op = get_reference_field(collection_name);
     if (!reference_field_op.ok()) {
         return Option<bool>(reference_field_op.code(), reference_field_op.error());
     }
-
-    std::shared_lock lock(mutex);
 
     const std::string doc_id_prefix = std::to_string(collection_id) + "_" + DOC_ID_PREFIX + "_";
     filter_node_t* filter_tree_root = nullptr;
@@ -2475,7 +2473,7 @@ Option<bool> Collection::get_reference_filter_ids(const std::string & filter_que
 
     // Reference helper field has the sequence id of other collection's documents.
     auto field_name = reference_field_op.get() + REFERENCE_HELPER_FIELD_SUFFIX;
-    auto filter_op = index->do_reference_filtering_with_lock(filter_tree_root, filter_result, field_name);
+    auto filter_op = index->do_reference_filtering_with_lock(filter_tree_root, filter_result, name, field_name);
     if (!filter_op.ok()) {
         return filter_op;
     }
