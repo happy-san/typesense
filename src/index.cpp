@@ -126,7 +126,7 @@ Index::Index(const std::string& name, const uint32_t collection_id, const Store*
             infix_index.emplace(a_field.name, infix_sets);
         }
 
-        if (a_field.is_reference_helper && a_field.is_array()) {
+        if (a_field.is_reference_helper) {
             auto num_tree = new num_tree_t;
             reference_index.emplace(a_field.name, num_tree);
 
@@ -220,12 +220,7 @@ Index::~Index() {
         delete vec_index_kv.second;
     }
 
-    for(auto & name_tree: reference_index) {
-        delete name_tree.second;
-        name_tree.second = nullptr;
-    }
-
-    reference_index.clear();
+    reference_fields.clear();
 
     for(auto & name_tree: object_array_reference_index) {
         delete name_tree.second;
@@ -875,13 +870,15 @@ void Index::index_field_in_memory(const std::string& collection_name, const fiel
         else if(afield.type == field_types::INT64) {
             auto num_tree = afield.range_index ? nullptr : numerical_index.at(afield.name);
             auto trie = afield.range_index ? range_index.at(afield.name) : nullptr;
-            iterate_and_index_numerical_field(iter_batch, afield, [&afield, num_tree, trie]
+            auto is_reference_field = reference_fields.count(afield.name) != 0;
+            iterate_and_index_numerical_field(iter_batch, afield, [&afield, num_tree, trie, is_reference_field]
                     (const index_record& record, uint32_t seq_id) {
                 int64_t value = record.doc[afield.name].get<int64_t>();
                 if (afield.range_index) {
                     trie->insert(value, seq_id);
                 } else {
-                    num_tree->insert(value, seq_id);
+                    is_reference_field ? num_tree->insert(seq_id, value) :
+                                            num_tree->insert(value, seq_id);
                 }
             });
         }
@@ -1044,10 +1041,11 @@ void Index::index_field_in_memory(const std::string& collection_name, const fiel
             // all other numerical arrays
             auto num_tree = afield.range_index ? nullptr : numerical_index.at(afield.name);
             auto trie = afield.range_index ? range_index.at(afield.name) : nullptr;
-            auto reference = reference_index.count(afield.name) != 0 ? reference_index.at(afield.name) : nullptr;
             auto object_array_reference = object_array_reference_index.count(afield.name) != 0 ?
                                                                 object_array_reference_index.at(afield.name) : nullptr;
-            iterate_and_index_numerical_field(iter_batch, afield, [&afield, num_tree, trie, reference, object_array_reference]
+            auto is_reference_field = reference_fields.count(afield.name) != 0;
+            iterate_and_index_numerical_field(iter_batch, afield, [&afield, num_tree, trie, object_array_reference,
+                                                                    is_reference_field]
                     (const index_record& record, uint32_t seq_id) {
                 for(size_t arr_i = 0; arr_i < record.doc[afield.name].size(); arr_i++) {
                     const auto& arr_value = record.doc[afield.name][arr_i];
@@ -1072,10 +1070,8 @@ void Index::index_field_in_memory(const std::string& collection_name, const fiel
                         if (afield.range_index) {
                             trie->insert(value, seq_id);
                         } else {
-                            num_tree->insert(value, seq_id);
-                        }
-                        if (reference != nullptr) {
-                            reference->insert(seq_id, value);
+                            is_reference_field ? num_tree->insert(seq_id, value) :
+                                                    num_tree->insert(value, seq_id);
                         }
                         if (object_array_reference != nullptr) {
                             (*object_array_reference)[std::make_pair(seq_id, arr_value.at(0))] = value;
@@ -1894,153 +1890,11 @@ Option<bool> Index::do_reference_filtering_with_lock(filter_node_t* const filter
 
     auto const reference_helper_field_name = field_name + fields::REFERENCE_HELPER_FIELD_SUFFIX;
     auto const is_nested_join = !ref_filter_result_iterator.reference.empty();
-    if (search_schema.at(reference_helper_field_name).is_singular()) { // Only one reference per doc.
-        if (sort_index.count(reference_helper_field_name) == 0) {
-            return Option<bool>(400, "`" + reference_helper_field_name + "` is not present in sort index.");
-        }
-        auto const& ref_index = *sort_index.at(reference_helper_field_name);
 
-        if (is_nested_join) {
-            // In case of nested join, we need to collect all the doc ids from the reference ids along with their references.
-            std::vector<std::pair<uint32_t, single_filter_result_t*>> id_pairs;
-            std::unordered_set<uint32_t> unique_doc_ids;
-
-            for (uint32_t i = 0; i < count; i++) {
-                auto& reference_doc_id = reference_docs[i];
-                auto reference_doc_references = std::move(ref_filter_result->coll_to_references[i]);
-                if (ref_index.count(reference_doc_id) == 0) { // Reference field might be optional.
-                    continue;
-                }
-                auto doc_id = ref_index.at(reference_doc_id);
-
-                id_pairs.emplace_back(std::make_pair(doc_id, new single_filter_result_t(reference_doc_id,
-                                                                                        std::move(reference_doc_references),
-                                                                                        false)));
-                unique_doc_ids.insert(doc_id);
-            }
-
-            if (id_pairs.empty()) {
-                return Option(true);
-            }
-
-            std::sort(id_pairs.begin(), id_pairs.end(), [](auto const& left, auto const& right) {
-                return left.first < right.first;
-            });
-
-            filter_result.count = unique_doc_ids.size();
-            filter_result.docs = new uint32_t[unique_doc_ids.size()];
-            filter_result.coll_to_references = new std::map<std::string, reference_filter_result_t>[unique_doc_ids.size()] {};
-
-            reference_filter_result_t previous_doc_references;
-            for (uint32_t i = 0, previous_doc = id_pairs[0].first + 1, result_index = 0; i < id_pairs.size(); i++) {
-                auto const& current_doc = id_pairs[i].first;
-                auto& reference_result = id_pairs[i].second;
-
-                if (current_doc != previous_doc) {
-                    filter_result.docs[result_index] = current_doc;
-                    if (result_index > 0) {
-                        std::map<std::string, reference_filter_result_t> references;
-                        references[ref_collection_name] = std::move(previous_doc_references);
-                        filter_result.coll_to_references[result_index - 1] = std::move(references);
-                    }
-
-                    result_index++;
-                    previous_doc = current_doc;
-                    aggregate_nested_references(reference_result, previous_doc_references);
-                } else {
-                    aggregate_nested_references(reference_result, previous_doc_references);
-                }
-            }
-
-            if (previous_doc_references.count != 0) {
-                std::map<std::string, reference_filter_result_t> references;
-                references[ref_collection_name] = std::move(previous_doc_references);
-                filter_result.coll_to_references[filter_result.count - 1] = std::move(references);
-            }
-
-            for (auto &item: id_pairs) {
-                delete item.second;
-            }
-
-            return Option(true);
-        }
-
-        // Collect all the doc ids from the reference ids.
-        std::vector<std::pair<uint32_t, uint32_t>> id_pairs;
-        std::unordered_set<uint32_t> unique_doc_ids;
-
-        for (uint32_t i = 0; i < count; i++) {
-            auto& reference_doc_id = reference_docs[i];
-            if (ref_index.count(reference_doc_id) == 0) { // Reference field might be optional.
-                continue;
-            }
-            auto doc_id = ref_index.at(reference_doc_id);
-
-            if (doc_id == Collection::reference_helper_sentinel_value) {
-                continue;
-            }
-
-            id_pairs.emplace_back(std::make_pair(doc_id, reference_doc_id));
-            unique_doc_ids.insert(doc_id);
-        }
-
-        if (id_pairs.empty()) {
-            return Option(true);
-        }
-
-        std::sort(id_pairs.begin(), id_pairs.end(), [](auto const& left, auto const& right) {
-            return left.first < right.first;
-        });
-
-        filter_result.count = unique_doc_ids.size();
-        filter_result.docs = new uint32_t[unique_doc_ids.size()];
-        filter_result.coll_to_references = new std::map<std::string, reference_filter_result_t>[unique_doc_ids.size()] {};
-
-        std::vector<uint32_t> previous_doc_references;
-        for (uint32_t i = 0, previous_doc = id_pairs[0].first + 1, result_index = 0; i < id_pairs.size(); i++) {
-            auto const& current_doc = id_pairs[i].first;
-            auto const& reference_doc_id = id_pairs[i].second;
-
-            if (current_doc != previous_doc) {
-                filter_result.docs[result_index] = current_doc;
-                if (result_index > 0) {
-                    auto& reference_result = filter_result.coll_to_references[result_index - 1];
-
-                    auto r = reference_filter_result_t(previous_doc_references.size(),
-                                                       new uint32_t[previous_doc_references.size()],
-                                                       false);
-                    std::copy(previous_doc_references.begin(), previous_doc_references.end(), r.docs);
-                    reference_result[ref_collection_name] = std::move(r);
-
-                    previous_doc_references.clear();
-                }
-
-                result_index++;
-                previous_doc = current_doc;
-                previous_doc_references.push_back(reference_doc_id);
-            } else {
-                previous_doc_references.push_back(reference_doc_id);
-            }
-        }
-
-        if (!previous_doc_references.empty()) {
-            auto& reference_result = filter_result.coll_to_references[filter_result.count - 1];
-
-            auto r = reference_filter_result_t(previous_doc_references.size(),
-                                               new uint32_t[previous_doc_references.size()],
-                                               false);
-            std::copy(previous_doc_references.begin(), previous_doc_references.end(), r.docs);
-            reference_result[ref_collection_name] = std::move(r);
-        }
-
-        return Option(true);
-    }
-
-    // Multiple references per doc.
-    if (reference_index.count(reference_helper_field_name) == 0) {
+    if (reference_fields.count(reference_helper_field_name) == 0) {
         return Option<bool>(400, "`" + reference_helper_field_name + "` is not present in reference index.");
     }
-    auto& ref_index = *reference_index.at(reference_helper_field_name);
+    auto& ref_index = *numerical_index.at(reference_helper_field_name);
 
     if (is_nested_join) {
         // In case of nested join, we need to collect all the doc ids from the reference ids along with their references.
@@ -2123,7 +1977,11 @@ Option<bool> Index::do_reference_filtering_with_lock(filter_node_t* const filter
         ref_index.search(EQUALS, reference_doc_id, &doc_ids, doc_ids_len);
 
         for (size_t j = 0; j < doc_ids_len; j++) {
-            auto doc_id = doc_ids[j];
+            auto const& doc_id = doc_ids[j];
+            if (doc_id == Collection::reference_helper_sentinel_value) {
+                continue;
+            }
+
             id_pairs.emplace_back(std::make_pair(doc_id, reference_doc_id));
             unique_doc_ids.insert(doc_id);
         }
@@ -6851,15 +6709,12 @@ void Index::remove_field(uint32_t seq_id, nlohmann::json& document, const std::s
                 trie->remove(value, seq_id);
             } else {
                 num_tree_t* num_tree = numerical_index.at(field_name);
-                num_tree->remove(value, seq_id);
+                reference_fields.count(field_name) != 0 ? num_tree->remove(seq_id, value) :
+                                                            num_tree->remove(value, seq_id);
             }
 
             if(search_field.facet) {
                 remove_facet_token(search_field, search_index, std::to_string(value), seq_id);
-            }
-
-            if (reference_index.count(field_name) != 0) {
-                 reference_index[field_name]->remove(seq_id, value);
             }
         }
 
@@ -7670,37 +7525,17 @@ Option<bool> Index::get_related_ids(const std::string& collection_name, const st
     std::shared_lock lock(mutex);
 
     auto const reference_helper_field_name = field_name + fields::REFERENCE_HELPER_FIELD_SUFFIX;
-    if (search_schema.count(reference_helper_field_name) == 0) {
-        return Option<bool>(400, "Could not find `" + reference_helper_field_name + "` in the collection `" + collection_name + "`.");
+    if (reference_fields.count(reference_helper_field_name) == 0) {
+        return Option<bool>(400, "`" + reference_helper_field_name + "` field is not present in reference "
+                                                                     "index of `" + collection_name + "` collection.");
     }
 
     auto const no_match_op = Option<bool>(400, "Could not find `" + reference_helper_field_name + "` value for doc `" +
                                                std::to_string(seq_id) + "`.");
-    if (search_schema.at(reference_helper_field_name).is_singular()) {
-        if (sort_index.count(reference_helper_field_name) == 0) {
-            return no_match_op;
-        }
-
-        auto const& ref_index = sort_index.at(reference_helper_field_name);
-        auto const it = ref_index->find(seq_id);
-        if (it == ref_index->end()) {
-            return no_match_op;
-        }
-
-        const uint32_t id = it->second;
-        if (id != Collection::reference_helper_sentinel_value) {
-            result.emplace_back(id);
-        }
-        return Option<bool>(true);
-    }
-
-    if (reference_index.count(reference_helper_field_name) == 0) {
-        return no_match_op;
-    }
 
     size_t ids_len = 0;
     uint32_t* ids = nullptr;
-    reference_index.at(reference_helper_field_name)->search(EQUALS, seq_id, &ids, ids_len);
+    numerical_index.at(reference_helper_field_name)->search(EQUALS, seq_id, &ids, ids_len);
     if (ids_len == 0) {
         return no_match_op;
     }

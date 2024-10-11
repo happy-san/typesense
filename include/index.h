@@ -389,8 +389,14 @@ private:
 
     spp::sparse_hash_map<std::string, num_tree_t*> numerical_index;
 
-    // reference_helper_field => (seq_id => ref_seq_ids)
-    // Only used when the reference field is an array type otherwise sort_index is used.
+    // Reference helper fields have either int64/int64[] type. We have two indexes for references.
+    // 1. numerical_index (reference_helper_field => (ref_seq_ids => seq_id))
+    //     Helps in finding all the documents of this collection that reference the other collection given doc_id of
+    //     the other collection. Useful for operations like cascade deletion.
+    //
+    // 2. reference_index (reference_helper_field => (seq_id => ref_seq_ids))
+    //     Helps in finding all the documents of the other collection that are referenced by a given doc_id of this
+    //     collection. Useful for operations like joins.
     spp::sparse_hash_map<std::string, num_tree_t*> reference_index;
 
     /// field_name => ((doc_id, object_index) => ref_doc_id)
