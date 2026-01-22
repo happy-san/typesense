@@ -1001,6 +1001,7 @@ bool validate_and_add_leaf(art_leaf* leaf, const bool last_token, const std::str
     return true;
 }
 
+int art_fuzzy_search_i_calls_count = 0;
 bool validate_and_add_leaf(art_leaf* leaf,
                            const std::string& prev_token, const art_leaf* prev_leaf,
                            const art_leaf* exact_leaf,

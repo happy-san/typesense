@@ -2879,12 +2879,13 @@ Option<nlohmann::json> Collection::search(collection_search_args_t& coll_args) {
     if (!init_index_search_args_op.ok()) {
         return Option<nlohmann::json>(init_index_search_args_op.code(), init_index_search_args_op.error());
     }
-
+extern int art_fuzzy_search_i_calls_count;
+art_fuzzy_search_i_calls_count = 0;
     const auto search_op = index->run_search(search_params_guard.get());
     if (!search_op.ok()) {
         return Option<nlohmann::json>(search_op.code(), search_op.error());
     }
-
+LOG(INFO) << "art_fuzzy_search_i_calls_count: " << art_fuzzy_search_i_calls_count;
     const auto& search_params = search_params_guard.get();
     const auto& group_limit = search_params->group_limit;
     const auto& sort_fields_std = search_params->sort_fields_std;

@@ -28,6 +28,8 @@ bool or_iterator_t::equals(std::vector<or_iterator_t>& its) {
 }
 
 bool or_iterator_t::equals2(std::vector<or_iterator_t>& its) {
+extern int art_fuzzy_search_i_calls_count;
+art_fuzzy_search_i_calls_count++;
     return its[0].id() == its[1].id();
 }
 
@@ -172,7 +174,8 @@ uint32_t or_iterator_t::id() const {
 
 bool or_iterator_t::take_id(result_iter_state_t& istate, uint32_t id, bool& is_excluded) {
     is_excluded = false;
-
+extern int art_fuzzy_search_i_calls_count;
+art_fuzzy_search_i_calls_count++;
     // decide if this result id should be excluded
     if(istate.excluded_result_ids_size != 0) {
         if (std::binary_search(istate.excluded_result_ids,
