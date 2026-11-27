@@ -2747,12 +2747,11 @@ Option<bool> Index::run_search(search_args* search_params) {
 }
 
 void Index::collate_included_ids(const std::vector<token_t>& q_included_tokens,
-                                 const std::map<size_t, std::map<size_t, uint32_t>> & included_ids_map,
+                                 const std::map<size_t, std::map<size_t, single_filter_result_t>> & included_ids_map,
                                  Topster<KV>*& curated_topster,
                                  const size_t group_limit,
                                  const std::vector<std::string>& group_by_fields,
-                                 const bool group_missing_values,
-                                 const  std::map<std::string, reference_filter_result_t>& references) const {
+                                 const bool group_missing_values) const {
 
     if(included_ids_map.empty()) {
         return;
@@ -2765,7 +2764,8 @@ void Index::collate_included_ids(const std::vector<token_t>& q_included_tokens,
 
         for(const auto& index_seq_id: pos_ids.second) {
             uint32_t inner_pos = index_seq_id.first;
-            uint32_t seq_id = index_seq_id.second;
+            const auto& result = index_seq_id.second;
+            uint32_t seq_id = result.seq_id;
 
             // not grouped curated hits should deduped in a per-document basis in union mode
             uint64_t distinct_id = (group_limit == 0) ? seq_id : 1;
@@ -2786,7 +2786,7 @@ void Index::collate_included_ids(const std::vector<token_t>& q_included_tokens,
             scores[2] = int64_t(1);
 
             //included ids are upstream validated, so can directly add references
-            KV kv(0, seq_id, distinct_id, 0, scores, references);
+            KV kv(0, seq_id, distinct_id, 0, scores, result.reference_filter_results);
             curated_topster->add(&kv);
         }
     }
@@ -3612,14 +3612,15 @@ Option<bool> Index::search(std::vector<query_tokens_t>& field_query_tokens, cons
                                       group_found_params, true, group_key_allowlist);
 
     std::set<uint32_t> curated_ids;
-    std::map<size_t, std::map<size_t, uint32_t>> included_ids_map;  // outer pos => inner pos => list of IDs
+    // outer position => inner position => document and references
+    std::map<size_t, std::map<size_t, single_filter_result_t>> included_ids_map;
     std::vector<uint32_t> included_ids_vec;
 
     process_curated_ids(included_ids, excluded_ids, group_limit, filter_curated_hits,
                         filter_result_iterator, curated_ids, included_ids_map,
                         included_ids_vec);
     collate_included_ids({}, included_ids_map, curated_topster, group_limit,
-                         group_by_fields, group_missing_values, filter_result_iterator->reference);
+                         group_by_fields, group_missing_values);
     filter_result_iterator->reset();
     search_cutoff = search_cutoff || filter_result_iterator->validity == filter_result_iterator_t::timed_out;
 
@@ -4863,7 +4864,7 @@ void Index::process_curated_ids(const std::vector<std::pair<uint32_t, uint32_t>>
                                 const size_t group_limit,
                                 const bool filter_curated_hits, filter_result_iterator_t* const filter_result_iterator,
                                 std::set<uint32_t>& curated_ids,
-                                std::map<size_t, std::map<size_t, uint32_t>>& included_ids_map,
+                                std::map<size_t, std::map<size_t, single_filter_result_t>>& included_ids_map,
                                 std::vector<uint32_t>& included_ids_vec) const {
 
     for(const auto& seq_id_pos: included_ids) {
@@ -4875,10 +4876,15 @@ void Index::process_curated_ids(const std::vector<std::pair<uint32_t, uint32_t>>
 
     // if `filter_curated_hits` is enabled, we will remove curated hits that don't match filter condition
     std::set<uint32_t> included_ids_set;
+    std::map<uint32_t, std::map<std::string, reference_filter_result_t>> seq_id_to_references;
 
     if(!filter_result_iterator->is_filter_provided() || !filter_curated_hits) {
         included_ids_set.insert(included_ids_vec.begin(), included_ids_vec.end());
-    } else if(filter_result_iterator->validity == filter_result_iterator_t::valid) {
+    }
+
+    // Capture matching references even when nonmatching pinned hits are retained.
+    if(filter_result_iterator->is_filter_provided() &&
+       filter_result_iterator->validity == filter_result_iterator_t::valid) {
         for (const auto &included_id: included_ids_vec) {
             auto result = filter_result_iterator->is_valid(included_id);
 
@@ -4888,6 +4894,7 @@ void Index::process_curated_ids(const std::vector<std::pair<uint32_t, uint32_t>>
 
             if (result == 1) {
                 included_ids_set.insert(included_id);
+                seq_id_to_references.emplace(included_id, filter_result_iterator->reference);
             }
         }
     }
@@ -4914,7 +4921,12 @@ void Index::process_curated_ids(const std::vector<std::pair<uint32_t, uint32_t>>
 
         for(size_t inner_pos = 0; inner_pos < num_inner_ids; inner_pos++) {
             auto seq_id = pos_ids.second[inner_pos];
-            included_ids_map[outer_pos][inner_pos] = seq_id;
+            auto& result = included_ids_map[outer_pos][inner_pos];
+            result.seq_id = seq_id;
+            const auto ref_it = seq_id_to_references.find(seq_id);
+            if (ref_it != seq_id_to_references.end()) {
+                result.reference_filter_results = ref_it->second;
+            }
             curated_ids.insert(seq_id);
         }
     }
@@ -4927,17 +4939,17 @@ void Index::process_curated_ids(const std::vector<std::pair<uint32_t, uint32_t>>
         std::sort(all_positions.begin(), all_positions.end());
         all_positions.erase(unique(all_positions.begin(), all_positions.end()), all_positions.end());
 
-        std::map<size_t, std::map<size_t, uint32_t>> new_included_ids_map;
+        std::map<size_t, std::map<size_t, single_filter_result_t>> new_included_ids_map;
         auto included_id_it = included_ids_map.begin();
         auto all_pos_it = all_positions.begin();
 
         while(included_id_it != included_ids_map.end()) {
-            new_included_ids_map[*all_pos_it] = included_id_it->second;
+            new_included_ids_map[*all_pos_it] = std::move(included_id_it->second);
             all_pos_it++;
             included_id_it++;
         }
 
-        included_ids_map = new_included_ids_map;
+        included_ids_map = std::move(new_included_ids_map);
     }
 }
 

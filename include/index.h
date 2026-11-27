@@ -651,12 +651,11 @@ private:
                                       std::unordered_map<std::string, std::vector<uint32_t>>& token_to_offsets);
 
     void collate_included_ids(const std::vector<token_t>& q_included_tokens,
-                              const std::map<size_t, std::map<size_t, uint32_t>> & included_ids_map,
+                              const std::map<size_t, std::map<size_t, single_filter_result_t>> & included_ids_map,
                               Topster<KV>*& curated_topster,
                               const size_t group_limit,
                               const std::vector<std::string>& group_by_fields,
-                              const bool group_missing_values,
-                              const std::map<std::string, reference_filter_result_t>& references) const;
+                              const bool group_missing_values) const;
 
     static void compute_facet_stats(facet &a_facet, const std::string& raw_value,
                                     const std::string & field_type, const size_t count);
@@ -1221,7 +1220,7 @@ public:
                              const bool filter_curated_hits,
                              filter_result_iterator_t* const filter_result_iterator,
                              std::set<uint32_t>& curated_ids,
-                             std::map<size_t, std::map<size_t, uint32_t>>& included_ids_map,
+                             std::map<size_t, std::map<size_t, single_filter_result_t>>& included_ids_map,
                              std::vector<uint32_t>& included_ids_vec) const;
     
     int64_t get_doc_val_from_sort_index(sort_index_iterator it, uint32_t doc_seq_id) const;
